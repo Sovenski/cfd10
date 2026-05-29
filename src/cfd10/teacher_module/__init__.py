@@ -1,16 +1,29 @@
 """cfd10 teacher layer: the supervised turn detectors trained on the oracle.
 
 This package holds the models trained against the forward-looking turn oracle.
-Its first member is the **GBDT baseline** — the yardstick every later (TCN /
-distilled) teacher must beat, and the project's first genuinely out-of-sample
-result. :func:`fit_gbdt_cv` fits a per-side LightGBM classifier across
-leakage-safe purged walk-forward folds, tunes the decision threshold on the train
-fold only, and reports pooled out-of-sample event precision / recall / F1.
+Its first member is the **GBDT baseline** — the yardstick every later teacher must
+beat, and the project's first genuinely out-of-sample result. :func:`fit_gbdt_cv`
+fits a per-side LightGBM classifier across leakage-safe purged walk-forward folds,
+tunes the decision threshold on the train fold only, and reports pooled
+out-of-sample event precision / recall / F1.
+
+The deeper teacher is the dilated causal **TCN** (:mod:`.models.tcn`): it reads a
+window of bars-by-features and emits top/bottom turn logits, trained with the
+weighted-BCE loop in :mod:`.train` and isotonically calibrated by :mod:`.calibrate`
+on a held fold. Windows are materialised by
+:class:`.datasets.WindowDataset`, which never lets a window cross an asset
+boundary.
 
 Public API
 ----------
 Baseline
     :class:`GBDTConfig` (frozen) and :class:`FoldResult`; :func:`fit_gbdt_cv`.
+TCN teacher
+    :class:`TCNConfig`, :class:`TCNTurnModel`, :func:`ModelFactory` (models);
+    :class:`WindowDataset`, :class:`FeatureStats`, :func:`compute_feature_stats`,
+    :func:`make_labels` (datasets); :class:`TrainConfig`, :func:`train_teacher`
+    (training); :func:`predict_proba`, :func:`fit_calibrators`,
+    :func:`apply_calibrators` (calibration).
 Registry / factory
     :data:`TEACHER_REGISTRY`, :func:`register_teacher`, :func:`TeacherFactory`
     resolve named baseline fitters for config-driven pipelines.
@@ -29,6 +42,31 @@ from cfd10.teacher_module.baseline import (
     FoldResult,
     GBDTConfig,
     fit_gbdt_cv,
+)
+from cfd10.teacher_module.calibrate import (
+    ProbaResult,
+    SideCalibrator,
+    apply_calibrators,
+    fit_calibrators,
+    predict_proba,
+)
+from cfd10.teacher_module.datasets import (
+    FeatureStats,
+    WindowDataset,
+    compute_feature_stats,
+    make_labels,
+)
+from cfd10.teacher_module.models import (
+    MODEL_REGISTRY,
+    ModelFactory,
+    TCNConfig,
+    TCNTurnModel,
+    register_model,
+)
+from cfd10.teacher_module.train import (
+    TrainConfig,
+    resolve_device,
+    train_teacher,
 )
 from cfd10.utils.logging_conf import get_logger
 
@@ -93,6 +131,7 @@ def TeacherFactory(name: str) -> TeacherFitter:  # noqa: N802 (factory naming)
 register_teacher("gbdt")(fit_gbdt_cv)
 
 __all__ = [
+    # Baseline.
     "GBDTConfig",
     "FoldResult",
     "fit_gbdt_cv",
@@ -100,4 +139,25 @@ __all__ = [
     "TEACHER_REGISTRY",
     "register_teacher",
     "TeacherFactory",
+    # TCN models + factory.
+    "TCNConfig",
+    "TCNTurnModel",
+    "ModelFactory",
+    "MODEL_REGISTRY",
+    "register_model",
+    # Windowed dataset.
+    "WindowDataset",
+    "FeatureStats",
+    "compute_feature_stats",
+    "make_labels",
+    # Training.
+    "TrainConfig",
+    "train_teacher",
+    "resolve_device",
+    # Calibration.
+    "predict_proba",
+    "fit_calibrators",
+    "apply_calibrators",
+    "SideCalibrator",
+    "ProbaResult",
 ]
