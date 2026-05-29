@@ -29,3 +29,7 @@ credentials.json
 .ruff_cache/
 .mypy_cache/
 .ipynb_checkpoints/
+
+# Stray logs / scratch
+*.log
+temp/
