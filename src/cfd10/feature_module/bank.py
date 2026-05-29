@@ -34,6 +34,13 @@ from numpy.typing import NDArray
 from cfd10.feature_module.efficiency import efficiency_ratio
 from cfd10.feature_module.garch_har import gjr_asym, har_vol
 from cfd10.feature_module.momentum import mom_divergence, mom_velocity, price_return
+from cfd10.feature_module.overextension import (
+    dist_above_sma_z,
+    drawdown_from_high,
+    realized_vol_pct,
+    up_streak_norm,
+    vol_of_vol,
+)
 from cfd10.feature_module.sma_pir import csum_close, pir_for_scale_series
 from cfd10.feature_module.trend import linreg_slope_norm, sma_slope
 from cfd10.feature_module.vola import vola_position, vola_raw
@@ -144,6 +151,16 @@ class FeatureConfig:
         vola_range_len: Trailing window for the volatility position-in-range.
         trend_scales: SMA scales for the slope / linreg-slope features.
         mom_lookbacks: Lookbacks ``L`` for the momentum family.
+        include_overextension: When ``True``, append the optional overextension /
+            vol-regime block (classic top tells) after the configured ``blocks``.
+            Default ``False`` so existing behaviour is unchanged.
+        oe_sma_lengths: Long SMA windows for :func:`dist_above_sma_z`.
+        oe_z_win: Trailing window for the z-distance normalising std.
+        oe_dd_lookbacks: Lookbacks for :func:`drawdown_from_high`.
+        oe_rv_win: Window for the rolling realized volatility.
+        oe_rv_range_len: Trailing window for the realized-vol position-in-range.
+        oe_streak_cap: Saturation count for :func:`up_streak_norm`.
+        oe_vov_win: Shared window for :func:`vol_of_vol`.
         blocks: Names of the registered blocks to assemble, in order.
     """
 
@@ -164,6 +181,16 @@ class FeatureConfig:
     trend_scales: tuple[int, ...] = (20, 50, 100)
 
     mom_lookbacks: tuple[int, ...] = (10, 20, 40)
+
+    # Optional overextension / vol-regime block (top tells). Off by default.
+    include_overextension: bool = False
+    oe_sma_lengths: tuple[int, ...] = (50, 100, 200)
+    oe_z_win: int = 100
+    oe_dd_lookbacks: tuple[int, ...] = (20, 50, 100)
+    oe_rv_win: int = 20
+    oe_rv_range_len: int = 100
+    oe_streak_cap: int = 5
+    oe_vov_win: int = 20
 
     blocks: tuple[str, ...] = field(default=_DEFAULT_BLOCKS)
 
@@ -335,6 +362,39 @@ def _block_garch_har(
     }
 
 
+@register_feature("overextension")
+def _block_overextension(
+    df: pd.DataFrame, cfg: FeatureConfig
+) -> dict[str, NDArray[np.float64]]:
+    """Overextension / vol-regime block — classic top tells (optional).
+
+    Emits, all dimensionless and bounded:
+
+    * ``dist_above_sma_z_l{length}`` per ``oe_sma_lengths`` (squashed z-distance
+      above the long SMA, ``(-1, 1)``; normalised over ``oe_z_win``).
+    * ``drawdown_from_high_l{lb}`` per ``oe_dd_lookbacks`` (``<= 0``; near 0 at
+      tops).
+    * ``realized_vol_pct`` (vol-regime percentile, ``[0, 1]``).
+    * ``up_streak_norm`` (overbought-persistence count, ``[0, 1]``).
+    * ``vol_of_vol`` (vol-of-vol percentile, ``[0, 1]``).
+
+    Wired in only when :attr:`FeatureConfig.include_overextension` is ``True``
+    (see :func:`build_feature_matrix`).
+    """
+    close = _col(df, "close")
+    out: dict[str, NDArray[np.float64]] = {}
+    for length in cfg.oe_sma_lengths:
+        out[f"dist_above_sma_z_l{length}"] = dist_above_sma_z(
+            close, int(length), cfg.oe_z_win
+        )
+    for lb in cfg.oe_dd_lookbacks:
+        out[f"drawdown_from_high_l{lb}"] = drawdown_from_high(close, int(lb))
+    out["realized_vol_pct"] = realized_vol_pct(close, cfg.oe_rv_win, cfg.oe_rv_range_len)
+    out["up_streak_norm"] = up_streak_norm(close, cfg.oe_streak_cap)
+    out["vol_of_vol"] = vol_of_vol(close, cfg.oe_vov_win)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Assembly.                                                                   #
 # --------------------------------------------------------------------------- #
@@ -375,9 +435,16 @@ def build_feature_matrix(
     """
     _validate_frame(df)
 
+    # The optional overextension block is appended (not part of the default
+    # ``blocks`` tuple) so existing configs are byte-for-byte unchanged. Guard
+    # against double-listing if a caller already names it explicitly.
+    block_order: tuple[str, ...] = cfg.blocks
+    if cfg.include_overextension and "overextension" not in block_order:
+        block_order = (*block_order, "overextension")
+
     columns: dict[str, NDArray[np.float64]] = {}
     feature_names: list[str] = []
-    for block_name in cfg.blocks:
+    for block_name in block_order:
         block = FeatureBankFactory(block_name)
         produced = block(df, cfg)
         for name, series in produced.items():
@@ -398,7 +465,7 @@ def build_feature_matrix(
     logger.info(
         "build_feature_matrix: assembled %d features from %d blocks over %d bars",
         len(feature_names),
-        len(cfg.blocks),
+        len(block_order),
         len(df),
     )
     # Construct in one shot to keep column order and avoid fragmentation.

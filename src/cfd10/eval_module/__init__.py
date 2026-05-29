@@ -13,6 +13,12 @@ Metrics (:mod:`cfd10.eval_module.metrics`)
     :func:`event_prf` — event ``(precision, recall, f1)`` over a tolerance; the
     function the baseline calls. :func:`prf_from_counts` converts a confusion
     triple directly.
+Ranking (:mod:`cfd10.eval_module.ranking`)
+    Threshold-free, n-weighted scores that survive an F1 collapse:
+    :func:`average_precision` (the headline PR-AUC, with an optional oracle-score
+    ``sample_weight``), :func:`precision_at_k` / :func:`recall_at_k` /
+    :func:`lift_at_k`, and their tolerance-windowed siblings
+    :func:`precision_at_k_event` / :func:`recall_at_k_event`.
 Deflation (:mod:`cfd10.eval_module.deflation`)
     :func:`deflated_metric` (Bailey / Lopez de Prado haircut or DSR probability),
     :func:`pbo_cscv` (CSCV probability of backtest overfitting in ``[0, 1]``),
@@ -33,6 +39,14 @@ from cfd10.eval_module.deflation import (
 )
 from cfd10.eval_module.events import EventMatch, match_events
 from cfd10.eval_module.metrics import event_prf, prf_from_counts
+from cfd10.eval_module.ranking import (
+    average_precision,
+    lift_at_k,
+    precision_at_k,
+    precision_at_k_event,
+    recall_at_k,
+    recall_at_k_event,
+)
 from cfd10.eval_module.report import Scorecard, ScoreRow
 
 __all__ = [
@@ -42,6 +56,13 @@ __all__ = [
     # Metrics.
     "event_prf",
     "prf_from_counts",
+    # Ranking.
+    "average_precision",
+    "precision_at_k",
+    "recall_at_k",
+    "lift_at_k",
+    "precision_at_k_event",
+    "recall_at_k_event",
     # Deflation.
     "deflated_metric",
     "pbo_cscv",

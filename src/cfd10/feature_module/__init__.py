@@ -43,6 +43,16 @@ from cfd10.feature_module.bank import (
 from cfd10.feature_module.efficiency import efficiency_ratio, efficiency_ratio_scalar
 from cfd10.feature_module.garch_har import gjr_asym, har_vol
 from cfd10.feature_module.momentum import mom_divergence, mom_velocity, price_return
+from cfd10.feature_module.overextension import (
+    OVEREXTENSION_FACTORY,
+    dist_above_sma_z,
+    drawdown_from_high,
+    get_overextension_fn,
+    realized_vol_pct,
+    register_overextension,
+    up_streak_norm,
+    vol_of_vol,
+)
 from cfd10.feature_module.pivots import pivot_drift, pivot_high, pivot_low
 from cfd10.feature_module.sma_pir import (
     AgreementResult,
@@ -147,6 +157,15 @@ __all__ = [
     "pivot_high",
     "pivot_low",
     "pivot_drift",
+    # Overextension / vol-regime (optional top tells).
+    "dist_above_sma_z",
+    "drawdown_from_high",
+    "realized_vol_pct",
+    "up_streak_norm",
+    "vol_of_vol",
+    "OVEREXTENSION_FACTORY",
+    "register_overextension",
+    "get_overextension_fn",
     # Dense feature bank.
     "build_feature_matrix",
     "FeatureConfig",
