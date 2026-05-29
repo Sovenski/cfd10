@@ -243,14 +243,28 @@ def fit_side(
     n_strong = int((tiers == "strong").sum())
     n_regular = int((tiers == "regular").sum())
     n_pos = int(y.sum())
+
+    # Class balancing. The STRUCTURAL oracle is ~0.2% positive, so an unweighted
+    # GBDT (scale_pos_weight=1) lets the turns wash out: probabilities stay
+    # near-flat, train event-F1 ~0, and threshold tuning then defaults to ~max ->
+    # ZERO predicted events. Re-weight the positive class by the negative/positive
+    # ratio so structural turns actually drive the tree splits. The train-only
+    # threshold tuner downstream still controls the precision/recall trade-off.
+    from dataclasses import replace
+
+    n_neg = int(y.shape[0] - n_pos)
+    spw = float(n_neg / max(n_pos, 1))
+    cfg = replace(cfg, scale_pos_weight=spw)
     logger.info(
-        "fit_pooled[%s]: %d positives (%d strong, %d regular) / %d rows (%.3f%%)",
+        "fit_pooled[%s]: %d positives (%d strong, %d regular) / %d rows (%.3f%%); "
+        "scale_pos_weight=%.1f",
         side,
         n_pos,
         n_strong,
         n_regular,
         y.shape[0],
         100.0 * n_pos / max(y.shape[0], 1),
+        spw,
     )
 
     set_seed(cfg.seed)
@@ -398,7 +412,7 @@ def _render_report(
     lines.append(
         f"- GBDT: num_leaves={_GBDT_CFG.num_leaves}, "
         f"n_estimators={_GBDT_CFG.n_estimators}, lr={_GBDT_CFG.learning_rate}, "
-        f"scale_pos_weight={_GBDT_CFG.scale_pos_weight}."
+        "scale_pos_weight=auto (n_neg/n_pos per side)."
     )
     if not spx_present:
         lines.append("- NOTE: SPX absent from the pool; SPX-subset rows are empty.")
@@ -444,7 +458,7 @@ def _render_report(
     )
     lines.append("")
     lines.append(
-        "| side | baseline F1 | pooled-train SPX OOS F1 | Δ F1 | pooled (all) F1 |"
+        "| side | baseline F1 | pooled-train SPX OOS F1 | delta F1 | pooled (all) F1 |"
     )
     lines.append("| :-- | --: | --: | --: | --: |")
     base_by_side = {"low": _SINGLE_ASSET_LOW, "high": _SINGLE_ASSET_HIGH}
