@@ -1,0 +1,662 @@
+//@version=6
+indicator("Speculatores V15 Presets - Per-Side Regimes (edge voting)", overlay=true, max_bars_back=5000)
+
+// Preset architecture:
+// - Gold 1D Current: exact final 500-run HIGH/LOW winners from the optimizer logs
+// - DAX 1M Latest: dedicated paste target for the latest DAX 1M optimizer snapshot
+// - SPX 1D 2026-03-29 18:35 Trial 1225: diagnostic LOW-side trial from the live SPX daily run
+// - SPX 1D 2026-04-05 Parity High+Low: diagnostic preset to test both sides at once
+// - SPX 1D 2026-04-05 Heuristic Structural: manually inferred structural-turn candidate
+// - SPX 1D 2026-04-05 20:59 Salvaged Best: best HIGH/LOW recovered from corrupted overnight run
+// Gold 1D Current winners:
+// - HIGH: trial 292, score 0.33373417096497426
+// - LOW:  trial 465, score 0.40781242900926357
+// DAX 1M Latest staging values:
+// - HIGH: trial 226, score 2.484987
+// - LOW:  trial 292, score 2.866245
+// SPX 1D 2026-03-29 18:35 Trial 1225:
+// - LOW: trial 1225, score 0.000000
+// - HIGH side intentionally left on Gold 1D Current for comparison
+// SPX 1D 2026-04-05 Parity High+Low:
+// - HIGH: trial 4837, score 0.037415
+// - LOW: trial 1225, score 0.000000
+// SPX 1D 2026-04-05 Heuristic Structural:
+// - not optimizer-derived
+// - based on the parity-proven SPX high/low pair, but tightened for cleaner structural turns
+// SPX 1D 2026-05-23 Path A 5k:
+// - HIGH: trial 425, score 0.187983 (5k-trial run, new Path A scorer, 14 bar-based folds)
+// - LOW: trial 305, score 0.255162
+// - Stopped early at ~341/225 completed trials per side; partial-run best
+
+// SPX 1D 2026-05-18 21:51 Path A:
+// - HIGH: trial 228, score 0.019842 (new Path A scorer on 5 legacy folds)
+// - LOW: trial 102, score 0.017296
+// - NOTE: stability probe flagged both as 'likely outlier' — params may be fragile
+
+// SPX 1D 2026-04-05 20:59 Salvaged Best:
+// - HIGH: trial 4101, score 0.331818
+// - LOW: trial 2516, score 0.126710
+
+// SPX 1D 2026-05-23 V15 Run 2 (Scorer v3 winners):
+//   HIGH: trial 229, score 0.0679 (deflated 0.0667). use_edge_voting=False.
+//         er_directional + trend-only vote. No other gates.
+//         CAUTION: holdout IS=0.065 -> OOS=0.032 (~50% degradation on 2004-2026).
+//   LOW:  trial 130, score 0.1441 (deflated 0.1415). use_edge_voting=True, K=48.
+//         er_dir + trend + mom + mom_vel + vola consensus. GJR/HAR off.
+//         Holdout IS=0.189 ~= OOS=0.194 -- generalizes cleanly to modern regime.
+//   Scorer v3 = Hungarian matching + bootstrap-CI LCB + stable reference scale N=50.
+
+// SPX 1D 2026-05-24 V15 Run 3 (Scorer v4 winners):
+//   HIGH: trial 167, score 0.0656 (deflated 0.0635). use_edge_voting=True, K=28.
+//         trend + volume + mom_vel + vola consensus.
+//         CAUTION: holdout IS=0.025 -> OOS=0.000. HIGH is the noise floor on SPX 1D
+//         in this feature space. Keep on chart for comparison, not signal.
+//   LOW:  trial 169, score 0.0708 (deflated 0.0667). use_edge_voting=False.
+//         trend + volume + mom_vel + er_gate consensus. ATR vola, Trend mom_vel mode.
+//         Holdout IS=0.029 -> OOS=0.089 (OOS 3x better than IS).
+//         Stability local_mean/best = 99.7%. This is the v4 keeper.
+//   Scorer v4 oracle = structural-nest [50, 100, 200], catches 7/7 famous SPX lows.
+
+string GRP_PRESET = "Preset"
+string preset = input.string("Gold 1D Current", "Config Preset", options=["Gold 1D Current", "DAX 1M Latest", "SPX 1D 2026-03-29 18:35 Trial 1225", "SPX 1D 2026-04-05 Parity High+Low", "SPX 1D 2026-04-05 Heuristic Structural", "SPX 1D 2026-04-05 20:59 Salvaged Best", "SPX 1D 2026-05-18 21:51 Path A", "SPX 1D 2026-05-23 Path A 5k", "SPX 1D 2026-05-23 Path A 5k Edge", "SPX 1D 2026-05-23 V15 Run 1", "SPX 1D 2026-05-23 V15 Run 1 Selective", "SPX 1D 2026-05-23 V15 Run 2", "SPX 1D 2026-05-24 V15 Run 3", "Legacy V11 Gold"], group=GRP_PRESET)
+
+string GRP_DI = "Display"
+show_bg = input.bool(true, "Show Background Shading", group=GRP_DI)
+show_baseline = input.bool(true, "Show Baseline Pivots", group=GRP_DI)
+show_panel = input.bool(true, "Show Preset Panel", group=GRP_DI)
+
+pir_of(float val, int lookback) =>
+    float lo = ta.lowest(val, lookback)
+    float hi = ta.highest(val, lookback)
+    hi != lo ? (val - lo) / (hi - lo) : 0.5
+
+// === PARITY SHIM ============================================================
+// Pine's stateful ta.* built-ins (ta.sma, ta.lowest, ta.highest) all share ONE
+// internal history buffer per written call site. Putting them inside a loop
+// with a variable length silently corrupts the buffer — for each scale_step we
+// stomp the previous scale's state. That produced a 0.14-mean / 0.9-max
+// divergence vs Python and a 2x signal-count gap on Path A 5k.
+//
+// Fix: never call a stateful ta.* inside the variable-s loop. Use ta.cum(close)
+// (one stateless cumulative sum at module scope) to compute SMA of any length
+// as a constant-time subtraction, and reconstruct ratio history bar-by-bar
+// inside the loop with plain arithmetic on historical access. No state is
+// shared across scales because we don't touch any stateful built-in inside the
+// loop body.
+// ============================================================================
+float _csum_close = ta.cum(close)
+
+// SMA at scale s, evaluated at bar (current - back). Pure arithmetic, no state.
+sma_at(int s, int back) =>
+    float a = _csum_close[back]
+    float b = _csum_close[back + s]
+    na(a) or na(b) ? float(na) : (a - b) / s
+
+// PIR of the close/sma_s ratio series, scanned over the last `lb` bars.
+// Uses only historical access — no ta.lowest/ta.highest — so it has no
+// per-call-site state to corrupt across scales.
+pir_for_scale(int s, int lb) =>
+    float sma_now = sma_at(s, 0)
+    float val_now = sma_now > 0 ? close / sma_now : 1.0
+    float result = 0.5
+    if not na(val_now)
+        float lo = val_now
+        float hi = val_now
+        for back = 1 to lb - 1
+            float sma_b = sma_at(s, back)
+            float c_b = close[back]
+            float r_b = sma_b > 0 ? c_b / sma_b : 1.0
+            if not na(r_b)
+                lo := math.min(lo, r_b)
+                hi := math.max(hi, r_b)
+        result := hi != lo ? (val_now - lo) / (hi - lo) : 0.5
+    result
+
+calc_agreement(int scale_start, int scale_end, int scale_step, float pct_extreme) =>
+    int n_scales = 0
+    int scales_high = 0
+    int scales_low = 0
+    for s = scale_start to scale_end by scale_step
+        int lb = math.max(s, 20)
+        float pir_s = pir_for_scale(s, lb)
+        scales_high += pir_s > pct_extreme ? 1 : 0
+        scales_low += pir_s < (1.0 - pct_extreme) ? 1 : 0
+        n_scales += 1
+    float n_scales_f = math.max(n_scales, 1)
+    [scales_high, scales_low, n_scales, scales_high / n_scales_f, scales_low / n_scales_f]
+
+low_scale_flag(int s, float pct_extreme) =>
+    float sma_s = ta.sma(close, s)
+    float ratio_s = sma_s > 0 ? close / sma_s : 1.0
+    int lb = math.max(s, 20)
+    float pir_s = pir_of(ratio_s, lb)
+    pir_s < (1.0 - pct_extreme) ? 1.0 : 0.0
+
+high_scale_flag(int s, float pct_extreme) =>
+    float sma_s = ta.sma(close, s)
+    float ratio_s = sma_s > 0 ? close / sma_s : 1.0
+    int lb = math.max(s, 20)
+    float pir_s = pir_of(ratio_s, lb)
+    pir_s > pct_extreme ? 1.0 : 0.0
+
+calc_pivot_drift(array<float> pivots, int lookback) =>
+    float out = na
+    int min_pivots = math.max(lookback, 2)
+    int sz = array.size(pivots)
+    if sz >= min_pivots
+        float start_val = array.get(pivots, sz - min_pivots)
+        float end_val = array.get(pivots, sz - 1)
+        int pivot_count = min_pivots - 1
+        out := ((end_val - start_val) / math.max(math.abs(start_val), 1e-9)) / pivot_count
+    out
+
+safe_log_ratio(float num, float den) =>
+    math.log(math.max(num, 1e-10) / math.max(den, 1e-10))
+
+clamp_unit(float val) =>
+    math.max(-1.0, math.min(1.0, val))
+
+calc_gjr_asym() =>
+    float log_ret = safe_log_ratio(close, nz(close[1], close))
+    float r2 = log_ret * log_ret
+    float lr_var = math.max(nz(ta.sma(r2, 252), r2), 1e-12)
+    float gjr_alpha = 0.03
+    float gjr_beta = 0.90
+    float gjr_gamma = 0.08
+    float gjr_omega = math.max(lr_var * (1.0 - gjr_alpha - gjr_beta - gjr_gamma / 2.0), 1e-12)
+    var float gjr_var = na
+    var float sym_var = na
+    float prev_gjr = nz(gjr_var[1], lr_var)
+    float prev_sym = nz(sym_var[1], lr_var)
+    float prev_r2 = nz(r2[1], lr_var)
+    float leverage = nz(log_ret[1], 0.0) < 0 ? 1.0 : 0.0
+    gjr_var := math.max(gjr_omega + (gjr_alpha + gjr_gamma * leverage) * prev_r2 + gjr_beta * prev_gjr, 1e-12)
+    sym_var := math.max(gjr_omega + (gjr_alpha + gjr_gamma * 0.5) * prev_r2 + gjr_beta * prev_sym, 1e-12)
+    float gjr_asym_ratio = gjr_var / sym_var
+    float gjr_asym_norm = clamp_unit((gjr_asym_ratio - 1.0) / 0.1)
+    [gjr_asym_norm, gjr_asym_ratio]
+
+calc_har_vol() =>
+    float log_hl = safe_log_ratio(high, low)
+    float log_co = safe_log_ratio(close, open)
+    float gk_var = math.max(0.5 * log_hl * log_hl - (2.0 * math.log(2.0) - 1.0) * log_co * log_co, 1e-10)
+    float gk_weekly = nz(ta.sma(gk_var, 5), gk_var)
+    float gk_monthly = nz(ta.sma(gk_var, 22), gk_var)
+    float har_forecast = math.max(0.36 * gk_var + 0.28 * gk_weekly + 0.28 * gk_monthly, 1e-10)
+    float har_vol_ratio = math.sqrt(math.max(har_forecast, 1e-10)) / math.sqrt(math.max(gk_var, 1e-10))
+    float har_vol_norm = clamp_unit((har_vol_ratio - 1.0) / 0.5)
+    [har_vol_norm, har_vol_ratio]
+
+// Preset configs.
+bool is_gold_current = preset == "Gold 1D Current"
+bool is_dax_latest = preset == "DAX 1M Latest"
+bool is_spx_20260329_1835_trial1225 = preset == "SPX 1D 2026-03-29 18:35 Trial 1225"
+bool is_spx_20260405_parity_highlow = preset == "SPX 1D 2026-04-05 Parity High+Low"
+bool is_spx_20260405_heuristic_structural = preset == "SPX 1D 2026-04-05 Heuristic Structural"
+bool is_spx_20260405_2059_salvaged_best = preset == "SPX 1D 2026-04-05 20:59 Salvaged Best"
+bool is_spx_20260518_2151_pathA = preset == "SPX 1D 2026-05-18 21:51 Path A"
+bool is_spx_20260523_pathA_5k = preset == "SPX 1D 2026-05-23 Path A 5k"
+bool is_spx_20260523_pathA_5k_edge = preset == "SPX 1D 2026-05-23 Path A 5k Edge"
+bool is_spx_20260523_v15_run1 = preset == "SPX 1D 2026-05-23 V15 Run 1"
+bool is_spx_20260523_v15_run1_sel = preset == "SPX 1D 2026-05-23 V15 Run 1 Selective"
+bool is_spx_20260523_v15_run2 = preset == "SPX 1D 2026-05-23 V15 Run 2"
+bool is_spx_20260524_v15_run3 = preset == "SPX 1D 2026-05-24 V15 Run 3"
+bool is_legacy = preset == "Legacy V11 Gold"
+
+// "DAX 1M Latest" is the dedicated paste target for the latest DAX 1M snapshot.
+int baseline_lb = 20
+
+int S_detect_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 12 : is_spx_20260405_parity_highlow ? 11 : is_spx_20260405_heuristic_structural ? 14 : is_spx_20260405_2059_salvaged_best ? 9 : is_dax_latest ? 28 : is_spx_20260518_2151_pathA ? 18 : is_spx_20260523_pathA_5k ? 26 : is_spx_20260523_pathA_5k_edge ? 26 : is_spx_20260523_v15_run1 ? 5 : is_spx_20260523_v15_run1_sel ? 5 : is_spx_20260523_v15_run2 ? 24 : is_spx_20260524_v15_run3 ? 44 : 22
+int scale_start_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 3 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 24 : is_spx_20260405_2059_salvaged_best ? 3 : is_dax_latest ? 14 : is_spx_20260518_2151_pathA ? 10 : is_spx_20260523_pathA_5k ? 7 : is_spx_20260523_pathA_5k_edge ? 7 : is_spx_20260523_v15_run1 ? 22 : is_spx_20260523_v15_run1_sel ? 22 : is_spx_20260523_v15_run2 ? 25 : is_spx_20260524_v15_run3 ? 10 : 16
+int scale_end_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 270 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 158 : is_spx_20260405_2059_salvaged_best ? 193 : is_dax_latest ? 115 : is_spx_20260518_2151_pathA ? 147 : is_spx_20260523_pathA_5k ? 134 : is_spx_20260523_pathA_5k_edge ? 134 : is_spx_20260523_v15_run1 ? 182 : is_spx_20260523_v15_run1_sel ? 182 : is_spx_20260523_v15_run2 ? 125 : is_spx_20260524_v15_run3 ? 179 : 270
+int scale_step_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 3 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 3 : is_spx_20260405_2059_salvaged_best ? 18 : is_dax_latest ? 10 : is_spx_20260518_2151_pathA ? 7 : is_spx_20260523_pathA_5k ? 14 : is_spx_20260523_pathA_5k_edge ? 14 : is_spx_20260523_v15_run1 ? 8 : is_spx_20260523_v15_run1_sel ? 8 : is_spx_20260523_v15_run2 ? 14 : is_spx_20260524_v15_run3 ? 20 : 4
+int min_duration_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 13 : is_spx_20260405_parity_highlow ? 17 : is_spx_20260405_heuristic_structural ? 18 : is_spx_20260405_2059_salvaged_best ? 1 : is_dax_latest ? 2 : is_spx_20260518_2151_pathA ? 1 : is_spx_20260523_pathA_5k ? 1 : is_spx_20260523_pathA_5k_edge ? 1 : is_spx_20260523_v15_run1 ? 1 : is_spx_20260523_v15_run1_sel ? 1 : is_spx_20260523_v15_run2 ? 1 : is_spx_20260524_v15_run3 ? 20 : 5
+int cooldown_bars_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 9 : is_spx_20260405_parity_highlow ? 1 : is_spx_20260405_heuristic_structural ? 4 : is_spx_20260405_2059_salvaged_best ? 8 : is_dax_latest ? 2 : is_spx_20260518_2151_pathA ? 5 : is_spx_20260523_pathA_5k ? 15 : is_spx_20260523_pathA_5k_edge ? 15 : is_spx_20260523_v15_run1 ? 6 : is_spx_20260523_v15_run1_sel ? 6 : is_spx_20260523_v15_run2 ? 14 : is_spx_20260524_v15_run3 ? 14 : 2
+int price_gate_lb_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 23 : is_spx_20260405_parity_highlow ? 13 : is_spx_20260405_heuristic_structural ? 18 : is_spx_20260405_2059_salvaged_best ? 17 : is_dax_latest ? 95 : is_spx_20260518_2151_pathA ? 85 : is_spx_20260523_pathA_5k ? 57 : is_spx_20260523_pathA_5k_edge ? 57 : is_spx_20260523_v15_run1 ? 40 : is_spx_20260523_v15_run1_sel ? 40 : is_spx_20260523_v15_run2 ? 34 : is_spx_20260524_v15_run3 ? 97 : 25
+int vola_range_len_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 120 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 152 : is_spx_20260405_2059_salvaged_best ? 119 : is_dax_latest ? 134 : is_spx_20260518_2151_pathA ? 97 : is_spx_20260523_pathA_5k ? 72 : is_spx_20260523_pathA_5k_edge ? 72 : is_spx_20260523_v15_run1 ? 99 : is_spx_20260523_v15_run1_sel ? 99 : is_spx_20260523_v15_run2 ? 166 : is_spx_20260524_v15_run3 ? 120 : 100
+int er_period_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 28 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 38 : is_spx_20260405_2059_salvaged_best ? 24 : is_dax_latest ? 23 : is_spx_20260518_2151_pathA ? 37 : is_spx_20260523_pathA_5k ? 21 : is_spx_20260523_pathA_5k_edge ? 21 : is_spx_20260523_v15_run1 ? 19 : is_spx_20260523_v15_run1_sel ? 19 : is_spx_20260523_v15_run2 ? 8 : is_spx_20260524_v15_run3 ? 58 : 5
+float pct_extreme_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.96 : is_spx_20260405_parity_highlow ? 0.7244 : is_spx_20260405_heuristic_structural ? 0.7400 : is_spx_20260405_2059_salvaged_best ? 0.7072 : is_dax_latest ? 0.7409 : is_spx_20260518_2151_pathA ? 0.7854 : is_spx_20260523_pathA_5k ? 0.7555 : is_spx_20260523_pathA_5k_edge ? 0.7555 : is_spx_20260523_v15_run1 ? 0.7839 : is_spx_20260523_v15_run1_sel ? 0.7839 : is_spx_20260523_v15_run2 ? 0.7868 : is_spx_20260524_v15_run3 ? 0.7440 : 0.90
+float min_agreement_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.75 : is_spx_20260405_parity_highlow ? 0.6013 : is_spx_20260405_heuristic_structural ? 0.6600 : is_spx_20260405_2059_salvaged_best ? 0.3689 : is_dax_latest ? 0.3180 : is_spx_20260518_2151_pathA ? 0.1777 : is_spx_20260523_pathA_5k ? 0.5312 : is_spx_20260523_pathA_5k_edge ? 0.5312 : is_spx_20260523_v15_run1 ? 0.8208 : is_spx_20260523_v15_run1_sel ? 0.8208 : is_spx_20260523_v15_run2 ? 0.3164 : is_spx_20260524_v15_run3 ? 0.3703 : 0.30
+float dur_extreme_pct_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.83 : is_spx_20260405_parity_highlow ? 0.6426 : is_spx_20260405_heuristic_structural ? 0.6800 : is_spx_20260405_2059_salvaged_best ? 0.5266 : is_dax_latest ? 0.6059 : is_spx_20260518_2151_pathA ? 0.9473 : is_spx_20260523_pathA_5k ? 0.5945 : is_spx_20260523_pathA_5k_edge ? 0.5945 : is_spx_20260523_v15_run1 ? 0.8019 : is_spx_20260523_v15_run1_sel ? 0.8019 : is_spx_20260523_v15_run2 ? 0.5269 : is_spx_20260524_v15_run3 ? 0.6365 : 0.93
+int confirm_count_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 5 : is_spx_20260405_parity_highlow ? 2 : is_spx_20260405_heuristic_structural ? 3 : is_spx_20260405_2059_salvaged_best ? 2 : is_dax_latest ? 4 : is_spx_20260518_2151_pathA ? 2 : is_spx_20260523_pathA_5k ? 3 : is_spx_20260523_pathA_5k_edge ? 3 : is_spx_20260523_v15_run1 ? 2 : is_spx_20260523_v15_run1_sel ? 2 : is_spx_20260523_v15_run2 ? 4 : is_spx_20260524_v15_run3 ? 2 : 1
+float vol_surge_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 1.5 : is_spx_20260405_parity_highlow ? 1.2168 : is_spx_20260405_heuristic_structural ? 1.2500 : is_spx_20260405_2059_salvaged_best ? 2.2881 : is_dax_latest ? 1.5495 : is_spx_20260518_2151_pathA ? 1.0731 : is_spx_20260523_pathA_5k ? 2.0844 : is_spx_20260523_pathA_5k_edge ? 2.0844 : is_spx_20260523_v15_run1 ? 2.3810 : is_spx_20260523_v15_run1_sel ? 2.3810 : is_spx_20260523_v15_run2 ? 1.6376 : is_spx_20260524_v15_run3 ? 1.5240 : 2.0
+float scale_div_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.35 : is_spx_20260405_parity_highlow ? 0.4414 : is_spx_20260405_heuristic_structural ? 0.3500 : is_spx_20260405_2059_salvaged_best ? 0.5268 : is_dax_latest ? 0.2582 : is_spx_20260518_2151_pathA ? 0.2588 : is_spx_20260523_pathA_5k ? 0.5463 : is_spx_20260523_pathA_5k_edge ? 0.5463 : is_spx_20260523_v15_run1 ? 0.2225 : is_spx_20260523_v15_run1_sel ? 0.2225 : is_spx_20260523_v15_run2 ? 0.1073 : is_spx_20260524_v15_run3 ? 0.1563 : 0.40
+float slope_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.22 : is_spx_20260405_parity_highlow ? 0.1411 : is_spx_20260405_heuristic_structural ? 0.1600 : is_spx_20260405_2059_salvaged_best ? 0.1347 : is_dax_latest ? 0.0447 : is_spx_20260518_2151_pathA ? 0.4398 : is_spx_20260523_pathA_5k ? 0.1082 : is_spx_20260523_pathA_5k_edge ? 0.1082 : is_spx_20260523_v15_run1 ? 0.2340 : is_spx_20260523_v15_run1_sel ? 0.2340 : is_spx_20260523_v15_run2 ? 0.0160 : is_spx_20260524_v15_run3 ? 0.2371 : 0.04
+float vola_high_pct_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.92 : is_spx_20260405_parity_highlow ? 0.6266 : is_spx_20260405_heuristic_structural ? 0.6600 : is_spx_20260405_2059_salvaged_best ? 0.5886 : is_dax_latest ? 0.9506 : is_spx_20260518_2151_pathA ? 0.5075 : is_spx_20260523_pathA_5k ? 0.8690 : is_spx_20260523_pathA_5k_edge ? 0.8690 : is_spx_20260523_v15_run1 ? 0.7133 : is_spx_20260523_v15_run1_sel ? 0.7133 : is_spx_20260523_v15_run2 ? 0.9335 : is_spx_20260524_v15_run3 ? 0.5283 : 0.71
+float vola_low_pct_high = is_gold_current or is_dax_latest or is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural or is_spx_20260405_2059_salvaged_best or is_spx_20260518_2151_pathA or is_spx_20260523_pathA_5k or is_spx_20260523_pathA_5k_edge or is_spx_20260523_v15_run1 or is_spx_20260523_v15_run1_sel or is_spx_20260523_v15_run2 or is_spx_20260524_v15_run3 ? 0.05 : 0.40
+int pivot_drift_lookback_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 5 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 11 : is_spx_20260405_2059_salvaged_best ? 16 : is_dax_latest ? 7 : is_spx_20260518_2151_pathA ? 6 : is_spx_20260523_pathA_5k ? 15 : is_spx_20260523_pathA_5k_edge ? 15 : is_spx_20260523_v15_run1 ? 16 : is_spx_20260523_v15_run1_sel ? 16 : is_spx_20260523_v15_run2 ? 2 : is_spx_20260524_v15_run3 ? 14 : 5
+float pivot_drift_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.008 : is_spx_20260405_parity_highlow ? 0.0081 : is_spx_20260405_heuristic_structural ? 0.0090 : is_spx_20260405_2059_salvaged_best ? 0.0035 : is_dax_latest ? 0.0227 : is_spx_20260518_2151_pathA ? 0.0015 : is_spx_20260523_pathA_5k ? 0.0160 : is_spx_20260523_pathA_5k_edge ? 0.0160 : is_spx_20260523_v15_run1 ? 0.0352 : is_spx_20260523_v15_run1_sel ? 0.0352 : is_spx_20260523_v15_run2 ? 0.0272 : is_spx_20260524_v15_run3 ? 0.0478 : 0.009
+float pivot_drift_gate_mult_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 8.0 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 3.4942 : is_spx_20260405_2059_salvaged_best ? 1.2319 : is_dax_latest ? 8.4367 : is_spx_20260518_2151_pathA ? 7.9785 : is_spx_20260523_pathA_5k ? 9.1306 : is_spx_20260523_pathA_5k_edge ? 9.1306 : is_spx_20260523_v15_run1 ? 9.0627 : is_spx_20260523_v15_run1_sel ? 9.0627 : is_spx_20260523_v15_run2 ? 8.1146 : is_spx_20260524_v15_run3 ? 1.0751 : 4.0
+int pivot_drift_confirm_bias_high = is_spx_20260405_2059_salvaged_best ? 2 : is_spx_20260518_2151_pathA ? 1 : is_spx_20260523_pathA_5k ? 1 : is_spx_20260523_pathA_5k_edge ? 1 : is_spx_20260523_v15_run1 ? 2 : is_spx_20260523_v15_run1_sel ? 2 : is_spx_20260523_v15_run2 ? 0 : is_spx_20260524_v15_run3 ? 0 : 1
+bool use_price_gate_high = true
+bool use_er_gate_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow ? false : is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_dax_latest ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? false : false
+bool use_pivot_drift_high = true
+bool er_directional_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_dax_latest ? true : is_spx_20260518_2151_pathA ? false : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? true : is_spx_20260523_v15_run1_sel ? true : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? false : false
+bool use_trend_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? true : is_dax_latest ? true : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? true : is_spx_20260523_v15_run1_sel ? true : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? true : false
+bool use_volume_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_dax_latest ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? true : false
+bool use_momentum_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? false : is_dax_latest ? true : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? false : false
+bool use_momentum_velocity_high = is_gold_current or is_spx_20260329_1835_trial1225 ? true : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? true : is_dax_latest ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? true : true
+bool use_volatility_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_dax_latest ? true : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? true : false
+bool use_gjr_asym_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? true : is_dax_latest ? true : is_spx_20260518_2151_pathA ? false : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? false : false
+bool use_har_vol_high = is_gold_current or is_spx_20260329_1835_trial1225 ? false : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? false : is_dax_latest ? true : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? false : false
+float gjr_vote_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.15 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.3150 : is_spx_20260405_2059_salvaged_best ? 0.0655 : is_dax_latest ? 0.4555 : is_spx_20260518_2151_pathA ? 0.1959 : is_spx_20260523_pathA_5k ? 0.0699 : is_spx_20260523_pathA_5k_edge ? 0.0699 : is_spx_20260523_v15_run1 ? 0.2770 : is_spx_20260523_v15_run1_sel ? 0.2770 : is_spx_20260523_v15_run2 ? 0.4001 : is_spx_20260524_v15_run3 ? 0.1227 : 0.15
+float har_vote_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.15 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.4205 : is_spx_20260405_2059_salvaged_best ? 0.1196 : is_dax_latest ? 0.1218 : is_spx_20260518_2151_pathA ? 0.4759 : is_spx_20260523_pathA_5k ? 0.3768 : is_spx_20260523_pathA_5k_edge ? 0.3768 : is_spx_20260523_v15_run1 ? 0.3205 : is_spx_20260523_v15_run1_sel ? 0.3205 : is_spx_20260523_v15_run2 ? 0.0637 : is_spx_20260524_v15_run3 ? 0.3990 : 0.15
+string momentum_velocity_mode_high = is_gold_current or is_spx_20260329_1835_trial1225 ? "Reversal" : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? "Reversal" : is_spx_20260405_2059_salvaged_best ? "Reversal" : is_dax_latest ? "Reversal" : is_spx_20260518_2151_pathA ? "Reversal" : is_spx_20260523_pathA_5k ? "Reversal" : is_spx_20260523_pathA_5k_edge ? "Reversal" : is_spx_20260523_v15_run1 ? "Reversal" : is_spx_20260523_v15_run1_sel ? "Reversal" : is_spx_20260523_v15_run2 ? "Reversal" : is_spx_20260524_v15_run3 ? "Reversal" : "Reversal"
+float momentum_velocity_thresh_high = is_gold_current or is_spx_20260329_1835_trial1225 ? 0.014 : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.0471 : is_spx_20260405_2059_salvaged_best ? 0.0142 : is_dax_latest ? 0.0008 : is_spx_20260518_2151_pathA ? 0.0209 : is_spx_20260523_pathA_5k ? 0.0173 : is_spx_20260523_pathA_5k_edge ? 0.0173 : is_spx_20260523_v15_run1 ? 0.0172 : is_spx_20260523_v15_run1_sel ? 0.0172 : is_spx_20260523_v15_run2 ? 0.0118 : is_spx_20260524_v15_run3 ? 0.0295 : 0.0
+string vola_method_high = is_gold_current or is_spx_20260329_1835_trial1225 ? "ATR" : is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? "StdDev" : is_spx_20260405_2059_salvaged_best ? "Intraday" : is_dax_latest ? "ATR" : is_spx_20260518_2151_pathA ? "Intraday" : is_spx_20260523_pathA_5k ? "ATR" : is_spx_20260523_pathA_5k_edge ? "ATR" : is_spx_20260523_v15_run1 ? "Intraday" : is_spx_20260523_v15_run1_sel ? "Intraday" : is_spx_20260523_v15_run2 ? "StdDev" : is_spx_20260524_v15_run3 ? "StdDev" : "StdDev"
+
+int S_detect_low = is_gold_current ? 26 : is_dax_latest ? 52 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 20 : is_spx_20260405_2059_salvaged_best ? 7 : is_spx_20260518_2151_pathA ? 11 : is_spx_20260523_pathA_5k ? 19 : is_spx_20260523_pathA_5k_edge ? 19 : is_spx_20260523_v15_run1 ? 8 : is_spx_20260523_v15_run1_sel ? 16 : is_spx_20260523_v15_run2 ? 11 : is_spx_20260524_v15_run3 ? 52 : 22
+int scale_start_low = is_gold_current ? 19 : is_dax_latest ? 4 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 17 : is_spx_20260405_2059_salvaged_best ? 29 : is_spx_20260518_2151_pathA ? 25 : is_spx_20260523_pathA_5k ? 12 : is_spx_20260523_pathA_5k_edge ? 12 : is_spx_20260523_v15_run1 ? 4 : is_spx_20260523_v15_run1_sel ? 11 : is_spx_20260523_v15_run2 ? 12 : is_spx_20260524_v15_run3 ? 13 : 16
+int scale_end_low = is_gold_current ? 250 : is_dax_latest ? 354 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 194 : is_spx_20260405_2059_salvaged_best ? 108 : is_spx_20260518_2151_pathA ? 289 : is_spx_20260523_pathA_5k ? 149 : is_spx_20260523_pathA_5k_edge ? 149 : is_spx_20260523_v15_run1 ? 209 : is_spx_20260523_v15_run1_sel ? 206 : is_spx_20260523_v15_run2 ? 105 : is_spx_20260524_v15_run3 ? 215 : 270
+int scale_step_low = is_gold_current ? 15 : is_dax_latest ? 5 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 7 : is_spx_20260405_2059_salvaged_best ? 20 : is_spx_20260518_2151_pathA ? 14 : is_spx_20260523_pathA_5k ? 8 : is_spx_20260523_pathA_5k_edge ? 8 : is_spx_20260523_v15_run1 ? 20 : is_spx_20260523_v15_run1_sel ? 17 : is_spx_20260523_v15_run2 ? 17 : is_spx_20260524_v15_run3 ? 5 : 4
+int min_duration_low = is_gold_current ? 2 : is_dax_latest ? 18 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 10 : is_spx_20260405_heuristic_structural ? 14 : is_spx_20260405_2059_salvaged_best ? 1 : is_spx_20260518_2151_pathA ? 2 : is_spx_20260523_pathA_5k ? 1 : is_spx_20260523_pathA_5k_edge ? 1 : is_spx_20260523_v15_run1 ? 2 : is_spx_20260523_v15_run1_sel ? 3 : is_spx_20260523_v15_run2 ? 5 : is_spx_20260524_v15_run3 ? 4 : 5
+int cooldown_bars_low = is_gold_current ? 7 : is_dax_latest ? 1 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 2 : is_spx_20260405_heuristic_structural ? 6 : is_spx_20260405_2059_salvaged_best ? 8 : is_spx_20260518_2151_pathA ? 6 : is_spx_20260523_pathA_5k ? 11 : is_spx_20260523_pathA_5k_edge ? 11 : is_spx_20260523_v15_run1 ? 3 : is_spx_20260523_v15_run1_sel ? 11 : is_spx_20260523_v15_run2 ? 15 : is_spx_20260524_v15_run3 ? 3 : 2
+int price_gate_lb_low = is_gold_current ? 58 : is_dax_latest ? 61 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 72 : is_spx_20260405_2059_salvaged_best ? 71 : is_spx_20260518_2151_pathA ? 84 : is_spx_20260523_pathA_5k ? 62 : is_spx_20260523_pathA_5k_edge ? 62 : is_spx_20260523_v15_run1 ? 66 : is_spx_20260523_v15_run1_sel ? 41 : is_spx_20260523_v15_run2 ? 43 : is_spx_20260524_v15_run3 ? 60 : 25
+int vola_range_len_low = is_gold_current ? 20 : is_dax_latest ? 79 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 35 : is_spx_20260405_2059_salvaged_best ? 92 : is_spx_20260518_2151_pathA ? 157 : is_spx_20260523_pathA_5k ? 168 : is_spx_20260523_pathA_5k_edge ? 168 : is_spx_20260523_v15_run1 ? 38 : is_spx_20260523_v15_run1_sel ? 138 : is_spx_20260523_v15_run2 ? 108 : is_spx_20260524_v15_run3 ? 184 : 100
+int er_period_low = is_gold_current ? 47 : is_dax_latest ? 27 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 52 : is_spx_20260405_2059_salvaged_best ? 46 : is_spx_20260518_2151_pathA ? 21 : is_spx_20260523_pathA_5k ? 8 : is_spx_20260523_pathA_5k_edge ? 8 : is_spx_20260523_v15_run1 ? 53 : is_spx_20260523_v15_run1_sel ? 32 : is_spx_20260523_v15_run2 ? 9 : is_spx_20260524_v15_run3 ? 36 : 5
+float pct_extreme_low = is_gold_current ? 0.85 : is_dax_latest ? 0.7024 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 0.8003 : is_spx_20260405_heuristic_structural ? 0.8200 : is_spx_20260405_2059_salvaged_best ? 0.7368 : is_spx_20260518_2151_pathA ? 0.7828 : is_spx_20260523_pathA_5k ? 0.7878 : is_spx_20260523_pathA_5k_edge ? 0.7878 : is_spx_20260523_v15_run1 ? 0.7041 : is_spx_20260523_v15_run1_sel ? 0.7536 : is_spx_20260523_v15_run2 ? 0.7628 : is_spx_20260524_v15_run3 ? 0.7297 : 0.90
+float min_agreement_low = is_gold_current ? 0.30 : is_dax_latest ? 0.4285 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 0.8471 : is_spx_20260405_heuristic_structural ? 0.8800 : is_spx_20260405_2059_salvaged_best ? 0.2720 : is_spx_20260518_2151_pathA ? 0.1302 : is_spx_20260523_pathA_5k ? 0.6754 : is_spx_20260523_pathA_5k_edge ? 0.6754 : is_spx_20260523_v15_run1 ? 0.1284 : is_spx_20260523_v15_run1_sel ? 0.7931 : is_spx_20260523_v15_run2 ? 0.1752 : is_spx_20260524_v15_run3 ? 0.5595 : 0.30
+float dur_extreme_pct_low = is_gold_current ? 0.72 : is_dax_latest ? 0.7797 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 0.5108 : is_spx_20260405_heuristic_structural ? 0.6000 : is_spx_20260405_2059_salvaged_best ? 0.8920 : is_spx_20260518_2151_pathA ? 0.8541 : is_spx_20260523_pathA_5k ? 0.5369 : is_spx_20260523_pathA_5k_edge ? 0.5369 : is_spx_20260523_v15_run1 ? 0.5221 : is_spx_20260523_v15_run1_sel ? 0.5199 : is_spx_20260523_v15_run2 ? 0.5550 : is_spx_20260524_v15_run3 ? 0.6241 : 0.93
+int confirm_count_low = is_gold_current ? 3 : is_dax_latest ? 1 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 1 : is_spx_20260405_heuristic_structural ? 2 : is_spx_20260405_2059_salvaged_best ? 4 : is_spx_20260518_2151_pathA ? 4 : is_spx_20260523_pathA_5k ? 5 : is_spx_20260523_pathA_5k_edge ? 5 : is_spx_20260523_v15_run1 ? 1 : is_spx_20260523_v15_run1_sel ? 1 : is_spx_20260523_v15_run2 ? 1 : is_spx_20260524_v15_run3 ? 2 : 1
+float vol_surge_thresh_low = is_gold_current ? 2.2 : is_dax_latest ? 1.2235 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 1.7413 : is_spx_20260405_2059_salvaged_best ? 1.1149 : is_spx_20260518_2151_pathA ? 1.1227 : is_spx_20260523_pathA_5k ? 2.3921 : is_spx_20260523_pathA_5k_edge ? 2.3921 : is_spx_20260523_v15_run1 ? 2.4163 : is_spx_20260523_v15_run1_sel ? 2.6458 : is_spx_20260523_v15_run2 ? 1.8823 : is_spx_20260524_v15_run3 ? 1.8537 : 2.0
+float scale_div_thresh_low = is_gold_current ? 0.39 : is_dax_latest ? 0.5177 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 0.4954 : is_spx_20260405_heuristic_structural ? 0.4000 : is_spx_20260405_2059_salvaged_best ? 0.5391 : is_spx_20260518_2151_pathA ? 0.5280 : is_spx_20260523_pathA_5k ? 0.3461 : is_spx_20260523_pathA_5k_edge ? 0.3461 : is_spx_20260523_v15_run1 ? 0.3256 : is_spx_20260523_v15_run1_sel ? 0.5935 : is_spx_20260523_v15_run2 ? 0.2181 : is_spx_20260524_v15_run3 ? 0.3094 : 0.40
+float slope_thresh_low = is_gold_current ? 0.15 : is_dax_latest ? 0.4808 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.4282 : is_spx_20260405_2059_salvaged_best ? 0.1505 : is_spx_20260518_2151_pathA ? 0.2751 : is_spx_20260523_pathA_5k ? 0.4101 : is_spx_20260523_pathA_5k_edge ? 0.4101 : is_spx_20260523_v15_run1 ? 0.3399 : is_spx_20260523_v15_run1_sel ? 0.3980 : is_spx_20260523_v15_run2 ? 0.4762 : is_spx_20260524_v15_run3 ? 0.3338 : 0.04
+float vola_high_pct_low = is_gold_current ? 0.78 : is_dax_latest ? 0.7280 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 0.8948 : is_spx_20260405_heuristic_structural ? 0.8900 : is_spx_20260405_2059_salvaged_best ? 0.6745 : is_spx_20260518_2151_pathA ? 0.9789 : 0.71
+float vola_low_pct_low = is_gold_current or is_dax_latest or is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural or is_spx_20260405_2059_salvaged_best ? 0.07 : is_spx_20260523_pathA_5k ? 0.6564 : is_spx_20260523_pathA_5k_edge ? 0.6564 : is_spx_20260523_v15_run1 ? 0.7211 : is_spx_20260523_v15_run1_sel ? 0.5747 : is_spx_20260523_v15_run2 ? 0.8497 : is_spx_20260524_v15_run3 ? 0.9639 : 0.40
+int pivot_drift_lookback_low = is_gold_current ? 10 : is_dax_latest ? 9 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 6 : is_spx_20260405_2059_salvaged_best ? 18 : is_spx_20260518_2151_pathA ? 11 : is_spx_20260523_pathA_5k ? 12 : is_spx_20260523_pathA_5k_edge ? 12 : is_spx_20260523_v15_run1 ? 12 : is_spx_20260523_v15_run1_sel ? 11 : is_spx_20260523_v15_run2 ? 9 : is_spx_20260524_v15_run3 ? 4 : 3
+float pivot_drift_thresh_low = is_gold_current ? 0.005 : is_dax_latest ? 0.0330 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.0500 : is_spx_20260405_2059_salvaged_best ? 0.0303 : is_spx_20260518_2151_pathA ? 0.0429 : is_spx_20260523_pathA_5k ? 0.0415 : is_spx_20260523_pathA_5k_edge ? 0.0415 : is_spx_20260523_v15_run1 ? 0.0131 : is_spx_20260523_v15_run1_sel ? 0.0259 : is_spx_20260523_v15_run2 ? 0.0199 : is_spx_20260524_v15_run3 ? 0.0364 : 0.009
+float pivot_drift_gate_mult_low = is_gold_current ? 4.0 : is_dax_latest ? 4.4990 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 3.3731 : is_spx_20260405_2059_salvaged_best ? 3.2778 : is_spx_20260518_2151_pathA ? 8.5753 : is_spx_20260523_pathA_5k ? 8.0721 : is_spx_20260523_pathA_5k_edge ? 8.0721 : is_spx_20260523_v15_run1 ? 6.5114 : is_spx_20260523_v15_run1_sel ? 8.8631 : is_spx_20260523_v15_run2 ? 7.1884 : is_spx_20260524_v15_run3 ? 5.4354 : 4.0
+int pivot_drift_confirm_bias_low = is_gold_current ? 0 : is_dax_latest ? 1 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0 : is_spx_20260405_2059_salvaged_best ? 2 : is_spx_20260518_2151_pathA ? 1 : is_spx_20260523_pathA_5k ? 2 : is_spx_20260523_pathA_5k_edge ? 2 : is_spx_20260523_v15_run1 ? 0 : is_spx_20260523_v15_run1_sel ? 2 : is_spx_20260523_v15_run2 ? 0 : is_spx_20260524_v15_run3 ? 0 : 1
+bool use_price_gate_low = true
+bool use_er_gate_low = is_gold_current ? false : is_dax_latest ? false : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? true : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? true : false
+bool use_pivot_drift_low = true
+bool er_directional_low = is_gold_current ? false : is_dax_latest ? false : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? true : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? true : false
+bool use_trend_low = is_gold_current ? false : is_dax_latest ? true : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? true : is_spx_20260518_2151_pathA ? false : is_spx_20260523_pathA_5k ? true : is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? true : false
+bool use_volume_low = is_gold_current ? false : is_dax_latest ? false : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? true : false
+bool use_momentum_low = is_gold_current ? false : is_dax_latest ? true : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? true : is_spx_20260518_2151_pathA ? false : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? false : false
+bool use_momentum_velocity_low = is_gold_current ? true : is_dax_latest ? false : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? true : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? true : true
+bool use_volatility_low = is_gold_current ? true : is_dax_latest ? true : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? true : is_spx_20260405_2059_salvaged_best ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? false : true
+bool use_gjr_asym_low = is_gold_current ? false : is_dax_latest ? false : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? true : is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? true : is_spx_20260523_v15_run1_sel ? true : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? false : false
+bool use_har_vol_low = is_gold_current ? false : is_dax_latest ? true : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? false : is_spx_20260405_2059_salvaged_best ? false : is_spx_20260518_2151_pathA ? true : is_spx_20260523_pathA_5k ? false : is_spx_20260523_pathA_5k_edge ? false : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? false : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? false : false
+float gjr_vote_thresh_low = is_gold_current ? 0.15 : is_dax_latest ? 0.3039 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow ? 0.1911 : is_spx_20260405_heuristic_structural ? 0.1911 : is_spx_20260405_2059_salvaged_best ? 0.3984 : is_spx_20260518_2151_pathA ? 0.3229 : is_spx_20260523_pathA_5k ? 0.2249 : is_spx_20260523_pathA_5k_edge ? 0.2249 : is_spx_20260523_v15_run1 ? 0.3949 : is_spx_20260523_v15_run1_sel ? 0.3772 : is_spx_20260523_v15_run2 ? 0.2633 : is_spx_20260524_v15_run3 ? 0.3361 : 0.15
+float har_vote_thresh_low = is_gold_current ? 0.15 : is_dax_latest ? 0.4326 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.1461 : is_spx_20260405_2059_salvaged_best ? 0.3033 : is_spx_20260518_2151_pathA ? 0.1963 : is_spx_20260523_pathA_5k ? 0.1424 : is_spx_20260523_pathA_5k_edge ? 0.1424 : is_spx_20260523_v15_run1 ? 0.2100 : is_spx_20260523_v15_run1_sel ? 0.2266 : is_spx_20260523_v15_run2 ? 0.3027 : is_spx_20260524_v15_run3 ? 0.4080 : 0.15
+string momentum_velocity_mode_low = is_gold_current ? "Reversal" : is_dax_latest ? "Reversal" : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? "Trend" : is_spx_20260405_2059_salvaged_best ? "Trend" : is_spx_20260518_2151_pathA ? "Trend" : is_spx_20260523_pathA_5k ? "Reversal" : is_spx_20260523_pathA_5k_edge ? "Reversal" : is_spx_20260523_v15_run1 ? "Reversal" : is_spx_20260523_v15_run1_sel ? "Reversal" : is_spx_20260523_v15_run2 ? "Trend" : is_spx_20260524_v15_run3 ? "Trend" : "Reversal"
+float momentum_velocity_thresh_low = is_gold_current ? 0.007 : is_dax_latest ? 0.0475 : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? 0.0064 : is_spx_20260405_2059_salvaged_best ? 0.0285 : is_spx_20260518_2151_pathA ? 0.0094 : is_spx_20260523_pathA_5k ? 0.0131 : is_spx_20260523_pathA_5k_edge ? 0.0131 : is_spx_20260523_v15_run1 ? 0.0416 : is_spx_20260523_v15_run1_sel ? 0.0466 : is_spx_20260523_v15_run2 ? 0.0400 : is_spx_20260524_v15_run3 ? 0.0127 : 0.0
+string vola_method_low = is_gold_current ? "ATR" : is_dax_latest ? "Intraday" : is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural ? "ATR" : is_spx_20260405_2059_salvaged_best ? "Intraday" : is_spx_20260518_2151_pathA ? "StdDev" : is_spx_20260523_pathA_5k ? "ATR" : is_spx_20260523_pathA_5k_edge ? "ATR" : is_spx_20260523_v15_run1 ? "StdDev" : is_spx_20260523_v15_run1_sel ? "StdDev" : is_spx_20260523_v15_run2 ? "Intraday" : is_spx_20260524_v15_run3 ? "ATR" : "StdDev"
+
+// Derived lookbacks.
+int slope_delta_high = math.max(math.round(S_detect_high / 4), 2)
+int vol_fast_len_high = math.max(math.round(S_detect_high / 4), 2)
+int vol_slow_len_high = S_detect_high
+int mom_lookback_high = S_detect_high
+int vola_calc_len_high = S_detect_high
+int vola_slope_lb_high = math.max(math.round(S_detect_high / 2), 2)
+
+int slope_delta_low = math.max(math.round(S_detect_low / 4), 2)
+int vol_fast_len_low = math.max(math.round(S_detect_low / 4), 2)
+int vol_slow_len_low = S_detect_low
+int mom_lookback_low = S_detect_low
+int vola_calc_len_low = S_detect_low
+int vola_slope_lb_low = math.max(math.round(S_detect_low / 2), 2)
+
+// Multi-scale agreement per side.
+[scales_high_high, scales_low_high, n_scales_high, agreement_high_high, agreement_low_high] = calc_agreement(scale_start_high, scale_end_high, scale_step_high, pct_extreme_high)
+[scales_high_low, scales_low_low, n_scales_low, agreement_high_low, agreement_low_low] = calc_agreement(scale_start_low, scale_end_low, scale_step_low, pct_extreme_low)
+
+if is_spx_20260329_1835_trial1225 or is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural
+    float spx_low_count_sum =
+         low_scale_flag(17, pct_extreme_low) +
+         low_scale_flag(24, pct_extreme_low) +
+         low_scale_flag(31, pct_extreme_low) +
+         low_scale_flag(38, pct_extreme_low) +
+         low_scale_flag(45, pct_extreme_low) +
+         low_scale_flag(52, pct_extreme_low) +
+         low_scale_flag(59, pct_extreme_low) +
+         low_scale_flag(66, pct_extreme_low) +
+         low_scale_flag(73, pct_extreme_low) +
+         low_scale_flag(80, pct_extreme_low) +
+         low_scale_flag(87, pct_extreme_low) +
+         low_scale_flag(94, pct_extreme_low) +
+         low_scale_flag(101, pct_extreme_low) +
+         low_scale_flag(108, pct_extreme_low) +
+         low_scale_flag(115, pct_extreme_low) +
+         low_scale_flag(122, pct_extreme_low) +
+         low_scale_flag(129, pct_extreme_low) +
+         low_scale_flag(136, pct_extreme_low) +
+         low_scale_flag(143, pct_extreme_low) +
+         low_scale_flag(150, pct_extreme_low) +
+         low_scale_flag(157, pct_extreme_low) +
+         low_scale_flag(164, pct_extreme_low) +
+         low_scale_flag(171, pct_extreme_low) +
+         low_scale_flag(178, pct_extreme_low) +
+         low_scale_flag(185, pct_extreme_low) +
+         low_scale_flag(192, pct_extreme_low)
+    scales_low_low := int(spx_low_count_sum)
+    n_scales_low := 26
+    agreement_low_low := spx_low_count_sum / 26.0
+
+if is_spx_20260405_parity_highlow or is_spx_20260405_heuristic_structural
+    float spx_high_count_sum =
+         high_scale_flag(24, pct_extreme_high) +
+         high_scale_flag(27, pct_extreme_high) +
+         high_scale_flag(30, pct_extreme_high) +
+         high_scale_flag(33, pct_extreme_high) +
+         high_scale_flag(36, pct_extreme_high) +
+         high_scale_flag(39, pct_extreme_high) +
+         high_scale_flag(42, pct_extreme_high) +
+         high_scale_flag(45, pct_extreme_high) +
+         high_scale_flag(48, pct_extreme_high) +
+         high_scale_flag(51, pct_extreme_high) +
+         high_scale_flag(54, pct_extreme_high) +
+         high_scale_flag(57, pct_extreme_high) +
+         high_scale_flag(60, pct_extreme_high) +
+         high_scale_flag(63, pct_extreme_high) +
+         high_scale_flag(66, pct_extreme_high) +
+         high_scale_flag(69, pct_extreme_high) +
+         high_scale_flag(72, pct_extreme_high) +
+         high_scale_flag(75, pct_extreme_high) +
+         high_scale_flag(78, pct_extreme_high) +
+         high_scale_flag(81, pct_extreme_high) +
+         high_scale_flag(84, pct_extreme_high) +
+         high_scale_flag(87, pct_extreme_high) +
+         high_scale_flag(90, pct_extreme_high) +
+         high_scale_flag(93, pct_extreme_high) +
+         high_scale_flag(96, pct_extreme_high) +
+         high_scale_flag(99, pct_extreme_high) +
+         high_scale_flag(102, pct_extreme_high) +
+         high_scale_flag(105, pct_extreme_high) +
+         high_scale_flag(108, pct_extreme_high) +
+         high_scale_flag(111, pct_extreme_high) +
+         high_scale_flag(114, pct_extreme_high) +
+         high_scale_flag(117, pct_extreme_high) +
+         high_scale_flag(120, pct_extreme_high) +
+         high_scale_flag(123, pct_extreme_high) +
+         high_scale_flag(126, pct_extreme_high) +
+         high_scale_flag(129, pct_extreme_high) +
+         high_scale_flag(132, pct_extreme_high) +
+         high_scale_flag(135, pct_extreme_high) +
+         high_scale_flag(138, pct_extreme_high) +
+         high_scale_flag(141, pct_extreme_high) +
+         high_scale_flag(144, pct_extreme_high) +
+         high_scale_flag(147, pct_extreme_high) +
+         high_scale_flag(150, pct_extreme_high) +
+         high_scale_flag(153, pct_extreme_high) +
+         high_scale_flag(156, pct_extreme_high)
+    scales_high_high := int(spx_high_count_sum)
+    n_scales_high := 45
+    agreement_high_high := spx_high_count_sum / 45.0
+
+bool ms_agree_high = agreement_high_high >= min_agreement_high
+bool ms_agree_low = agreement_low_low >= min_agreement_low
+
+float ratio_detect_high = close / ta.sma(close, S_detect_high)
+float ratio_detect_low = close / ta.sma(close, S_detect_low)
+float pir_detect_high = pir_of(ratio_detect_high, math.max(S_detect_high, 20))
+float pir_detect_low = pir_of(ratio_detect_low, math.max(S_detect_low, 20))
+
+float scale_div_high = pir_detect_high - agreement_high_high
+float scale_div_low = (1.0 - pir_detect_low) - agreement_low_low
+bool scale_div_high_flag = math.abs(scale_div_high) > scale_div_thresh_high
+bool scale_div_low_flag = math.abs(scale_div_low) > scale_div_thresh_low
+
+// Trend per side.
+float sma_val_high = ta.sma(close, S_detect_high)
+float slope_val_high = sma_val_high > 0 ? nz(sma_val_high - sma_val_high[slope_delta_high]) / (slope_delta_high * sma_val_high) * 1000 : 0.0
+float linreg_slope_high = ta.linreg(close, S_detect_high, 0) - ta.linreg(close, S_detect_high, 1)
+float linreg_norm_high = sma_val_high > 0 ? linreg_slope_high / sma_val_high * 1000 : 0.0
+bool trend_up_high = slope_val_high > slope_thresh_high and linreg_norm_high > slope_thresh_high
+
+float sma_val_low = ta.sma(close, S_detect_low)
+float slope_val_low = sma_val_low > 0 ? nz(sma_val_low - sma_val_low[slope_delta_low]) / (slope_delta_low * sma_val_low) * 1000 : 0.0
+float linreg_slope_low = ta.linreg(close, S_detect_low, 0) - ta.linreg(close, S_detect_low, 1)
+float linreg_norm_low = sma_val_low > 0 ? linreg_slope_low / sma_val_low * 1000 : 0.0
+bool trend_down_low = slope_val_low < -slope_thresh_low and linreg_norm_low < -slope_thresh_low
+
+// Duration at extremes per side.
+var int dur_at_high = 0
+var int dur_miss_high = 0
+if agreement_high_high > dur_extreme_pct_high
+    dur_at_high += 1
+    dur_miss_high := 0
+else
+    dur_miss_high += 1
+    if dur_miss_high > 1
+        dur_at_high := 0
+bool dur_high_flag = dur_at_high >= min_duration_high
+
+var int dur_at_low = 0
+var int dur_miss_low = 0
+if agreement_low_low > dur_extreme_pct_low
+    dur_at_low += 1
+    dur_miss_low := 0
+else
+    dur_miss_low += 1
+    if dur_miss_low > 1
+        dur_at_low := 0
+bool dur_low_flag = dur_at_low >= min_duration_low
+
+// Volume surge per side.
+float vol_surge_high = ta.sma(volume, vol_fast_len_high) / ta.sma(volume, vol_slow_len_high)
+float vol_surge_low = ta.sma(volume, vol_fast_len_low) / ta.sma(volume, vol_slow_len_low)
+
+// Momentum and momentum velocity per side.
+float price_ret_high = nz((close - close[mom_lookback_high]) / close[mom_lookback_high])
+float vol_ret_high = nz((volume - volume[mom_lookback_high]) / math.max(nz(volume[mom_lookback_high]), 1))
+float mom_diverge_high = price_ret_high * vol_ret_high
+float momentum_velocity_high = nz(price_ret_high - price_ret_high[1])
+bool mom_vel_high_ok = momentum_velocity_mode_high == "Trend" ? momentum_velocity_high >= math.abs(momentum_velocity_thresh_high) : momentum_velocity_high <= -math.abs(momentum_velocity_thresh_high)
+
+float price_ret_low = nz((close - close[mom_lookback_low]) / close[mom_lookback_low])
+float vol_ret_low = nz((volume - volume[mom_lookback_low]) / math.max(nz(volume[mom_lookback_low]), 1))
+float mom_diverge_low = price_ret_low * vol_ret_low
+float momentum_velocity_low = nz(price_ret_low - price_ret_low[1])
+bool mom_vel_low_ok = momentum_velocity_mode_low == "Trend" ? momentum_velocity_low <= -math.abs(momentum_velocity_thresh_low) : momentum_velocity_low >= math.abs(momentum_velocity_thresh_low)
+
+// Volatility per side.
+float vola_raw_high = vola_method_high == "ATR" ? ta.atr(vola_calc_len_high) : vola_method_high == "Intraday" ? ta.sma(close > 0 ? (high - low) / close : 0.0, vola_calc_len_high) : ta.stdev(close, vola_calc_len_high)
+float vola_pos_high = pir_of(vola_raw_high, vola_range_len_high)
+bool vola_elevated_high = vola_pos_high > vola_high_pct_high
+
+float vola_raw_low = vola_method_low == "ATR" ? ta.atr(vola_calc_len_low) : vola_method_low == "Intraday" ? ta.sma(close > 0 ? (high - low) / close : 0.0, vola_calc_len_low) : ta.stdev(close, vola_calc_len_low)
+float vola_pos_low = pir_of(vola_raw_low, vola_range_len_low)
+bool vola_elevated_low = vola_pos_low > vola_high_pct_low
+
+// Hard gates.
+bool price_high_ok = not use_price_gate_high or high >= ta.highest(high, price_gate_lb_high)[1]
+bool price_low_ok = not use_price_gate_low or low <= ta.lowest(low, price_gate_lb_low)[1]
+
+float er_path_high = 0.0
+for i = 0 to er_period_high - 1
+    er_path_high += math.abs(close[i] - close[i + 1])
+float er_net_high = er_directional_high ? close - close[er_period_high] : math.abs(close - close[er_period_high])
+float er_val_high = er_path_high > 0 ? er_net_high / er_path_high : 0.0
+bool er_gate_ok_high = not use_er_gate_high or er_val_high < nz(er_val_high[1], 0.0)
+
+float er_path_low = 0.0
+for i = 0 to er_period_low - 1
+    er_path_low += math.abs(close[i] - close[i + 1])
+float er_net_low = er_directional_low ? close - close[er_period_low] : math.abs(close - close[er_period_low])
+float er_val_low = er_path_low > 0 ? er_net_low / er_path_low : 0.0
+bool er_gate_ok_low = not use_er_gate_low or er_val_low < nz(er_val_low[1], 0.0)
+
+// GJR + HAR votes.
+[gjr_asym_norm, gjr_asym_ratio] = calc_gjr_asym()
+bool gjr_high_vote = gjr_asym_norm <= -gjr_vote_thresh_high
+bool gjr_low_vote = gjr_asym_norm >= gjr_vote_thresh_low
+[har_vol_norm, har_vol_ratio] = calc_har_vol()
+bool har_high_vote = har_vol_norm >= har_vote_thresh_high
+bool har_low_vote = har_vol_norm >= har_vote_thresh_low
+
+// Baseline pivots and pivot drift.
+float baseline_ph = ta.pivothigh(high, baseline_lb, baseline_lb)
+float baseline_pl = ta.pivotlow(low, baseline_lb, baseline_lb)
+
+var array<float> confirmed_pivots = array.new_float()
+float pivot_drift_high = nz(calc_pivot_drift(confirmed_pivots, pivot_drift_lookback_high), 0.0)
+float pivot_drift_low = nz(calc_pivot_drift(confirmed_pivots, pivot_drift_lookback_low), 0.0)
+if not na(baseline_ph)
+    array.push(confirmed_pivots, baseline_ph)
+if not na(baseline_pl)
+    array.push(confirmed_pivots, baseline_pl)
+bool pivot_drift_up_high = pivot_drift_high > pivot_drift_thresh_high
+bool pivot_drift_down_high = pivot_drift_high < -pivot_drift_thresh_high
+bool pivot_drift_gate_up_high = pivot_drift_high > (pivot_drift_thresh_high * pivot_drift_gate_mult_high)
+bool pivot_drift_up_low = pivot_drift_low > pivot_drift_thresh_low
+
+// === V15 EDGE-VOTING INFRASTRUCTURE ============================================
+// Per-side toggle that switches each vote from STATE evaluation (V14 default)
+// to EDGE evaluation (V15). An edge vote is true only when its underlying
+// indicator just transitioned from false to true within the last edge_window
+// bars. This eliminates burst-cluster false-tops during sustained rallies
+// where multiple indicators stay co-aligned for weeks.
+bool use_edge_voting_high = is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? true : is_spx_20260523_v15_run1_sel ? true : is_spx_20260523_v15_run2 ? false : is_spx_20260524_v15_run3 ? true : false
+bool use_edge_voting_low = is_spx_20260523_pathA_5k_edge ? true : is_spx_20260523_v15_run1 ? false : is_spx_20260523_v15_run1_sel ? true : is_spx_20260523_v15_run2 ? true : is_spx_20260524_v15_run3 ? false : false
+int edge_window_high = is_spx_20260523_pathA_5k_edge ? 5 : is_spx_20260523_v15_run1 ? 21 : is_spx_20260523_v15_run1_sel ? 21 : is_spx_20260523_v15_run2 ? 54 : is_spx_20260524_v15_run3 ? 28 : 5
+int edge_window_low = is_spx_20260523_pathA_5k_edge ? 5 : is_spx_20260523_v15_run1 ? 29 : is_spx_20260523_v15_run1_sel ? 21 : is_spx_20260523_v15_run2 ? 48 : is_spx_20260524_v15_run3 ? 11 : 5
+
+edge_or_state(bool v, int win, bool use_edge) =>
+    // Pine v6 has no nz()/na() overloads for series bool. Guard with bar_index
+    // to default to false on bars before win bars of history exist.
+    bool prev = bar_index >= win ? v[win] : false
+    use_edge ? (v and not prev) : v
+
+// Hoist inline predicates so they can be edge-wrapped uniformly.
+bool _vol_slow_high = vol_surge_high < (1.0 / vol_surge_thresh_high)
+bool _vol_surge_low = vol_surge_low > vol_surge_thresh_low
+bool _mom_div_neg_high = mom_diverge_high < 0
+bool _mom_div_neg_low = mom_diverge_low < 0
+
+// Effective per-vote bools — identical to state when use_edge_voting=false.
+bool t_up_h_eff = edge_or_state(trend_up_high, edge_window_high, use_edge_voting_high)
+bool pd_dn_h_eff = edge_or_state(pivot_drift_down_high, edge_window_high, use_edge_voting_high)
+bool vs_h_eff = edge_or_state(_vol_slow_high, edge_window_high, use_edge_voting_high)
+bool md_h_eff = edge_or_state(_mom_div_neg_high, edge_window_high, use_edge_voting_high)
+bool mv_h_eff = edge_or_state(mom_vel_high_ok, edge_window_high, use_edge_voting_high)
+bool va_h_eff = edge_or_state(vola_elevated_high, edge_window_high, use_edge_voting_high)
+bool g_h_eff = edge_or_state(gjr_high_vote, edge_window_high, use_edge_voting_high)
+bool h_h_eff = edge_or_state(har_high_vote, edge_window_high, use_edge_voting_high)
+
+bool t_dn_l_eff = edge_or_state(trend_down_low, edge_window_low, use_edge_voting_low)
+bool pd_up_l_eff = edge_or_state(pivot_drift_up_low, edge_window_low, use_edge_voting_low)
+bool vs_l_eff = edge_or_state(_vol_surge_low, edge_window_low, use_edge_voting_low)
+bool md_l_eff = edge_or_state(_mom_div_neg_low, edge_window_low, use_edge_voting_low)
+bool mv_l_eff = edge_or_state(mom_vel_low_ok, edge_window_low, use_edge_voting_low)
+bool va_l_eff = edge_or_state(vola_elevated_low, edge_window_low, use_edge_voting_low)
+bool g_l_eff = edge_or_state(gjr_low_vote, edge_window_low, use_edge_voting_low)
+bool h_l_eff = edge_or_state(har_low_vote, edge_window_low, use_edge_voting_low)
+// ===============================================================================
+
+// Confirmation votes. (uses _eff bools; identical to V14 state when use_edge_voting=false)
+int ph_confirms = 0
+ph_confirms += use_trend_high and t_up_h_eff ? 1 : 0
+ph_confirms += use_pivot_drift_high and pd_dn_h_eff ? 1 : 0
+ph_confirms += use_volume_high and vs_h_eff ? 1 : 0
+ph_confirms += use_momentum_high and md_h_eff ? 1 : 0
+ph_confirms += use_momentum_velocity_high and mv_h_eff ? 1 : 0
+ph_confirms += use_volatility_high and va_h_eff ? 1 : 0
+ph_confirms += use_gjr_asym_high and g_h_eff ? 1 : 0
+ph_confirms += use_har_vol_high and h_h_eff ? 1 : 0
+
+int pl_confirms = 0
+pl_confirms += use_trend_low and t_dn_l_eff ? 1 : 0
+pl_confirms += use_pivot_drift_low and pd_up_l_eff ? 1 : 0
+pl_confirms += use_volume_low and vs_l_eff ? 1 : 0
+pl_confirms += use_momentum_low and md_l_eff ? 1 : 0
+pl_confirms += use_momentum_velocity_low and mv_l_eff ? 1 : 0
+pl_confirms += use_volatility_low and va_l_eff ? 1 : 0
+pl_confirms += use_gjr_asym_low and g_l_eff ? 1 : 0
+pl_confirms += use_har_vol_low and h_l_eff ? 1 : 0
+
+int max_votes_high = (use_trend_high ? 1 : 0) + (use_volume_high ? 1 : 0) + (use_momentum_high ? 1 : 0) + (use_momentum_velocity_high ? 1 : 0) + (use_volatility_high ? 1 : 0) + (use_gjr_asym_high ? 1 : 0) + (use_har_vol_high ? 1 : 0)
+int max_votes_low = (use_trend_low ? 1 : 0) + (use_volume_low ? 1 : 0) + (use_momentum_low ? 1 : 0) + (use_momentum_velocity_low ? 1 : 0) + (use_volatility_low ? 1 : 0) + (use_gjr_asym_low ? 1 : 0) + (use_har_vol_low ? 1 : 0)
+
+int high_required = math.max(1, math.min(max_votes_high > 0 ? max_votes_high : 1, confirm_count_high + (use_pivot_drift_high and pivot_drift_up_high ? pivot_drift_confirm_bias_high : 0)))
+int low_required = math.max(1, math.min(max_votes_low > 0 ? max_votes_low : 1, confirm_count_low - (use_pivot_drift_low and pivot_drift_up_low ? pivot_drift_confirm_bias_low : 0)))
+
+bool gate_pass_high = price_high_ok and ms_agree_high and dur_high_flag and not scale_div_high_flag and er_gate_ok_high and (not use_pivot_drift_high or not pivot_drift_gate_up_high)
+bool gate_pass_low = price_low_ok and ms_agree_low and dur_low_flag and not scale_div_low_flag and er_gate_ok_low
+
+// Signal generation with cooldown.
+var int bars_since_high_signal = 999
+var int bars_since_low_signal = 999
+bars_since_high_signal += 1
+bars_since_low_signal += 1
+
+bool pivot_high = gate_pass_high and ph_confirms >= high_required and bars_since_high_signal > cooldown_bars_high
+bool pivot_low = gate_pass_low and pl_confirms >= low_required and bars_since_low_signal > cooldown_bars_low
+
+if pivot_high
+    bars_since_high_signal := 0
+if pivot_low
+    bars_since_low_signal := 0
+
+// Visuals.
+color bg_color = na
+if show_bg
+    if pivot_high
+        bg_color := color.new(color.red, 78)
+    else if pivot_low
+        bg_color := color.new(color.green, 78)
+bgcolor(bg_color)
+
+plotshape(pivot_high and not pivot_high[1], title="Pivot High", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.normal)
+plotshape(pivot_low and not pivot_low[1], title="Pivot Low", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.normal)
+plotshape(show_baseline and not na(baseline_ph), title="Baseline High", style=shape.diamond, location=location.abovebar, color=color.new(color.purple, 20), offset=-baseline_lb, size=size.tiny)
+plotshape(show_baseline and not na(baseline_pl), title="Baseline Low", style=shape.diamond, location=location.belowbar, color=color.new(color.purple, 20), offset=-baseline_lb, size=size.tiny)
+
+if show_panel
+    var table panel = table.new(position.bottom_right, 2, 9, bgcolor=color.new(color.black, 80), border_width=1)
+    table.cell(panel, 0, 0, "Preset", text_color=color.gray, text_size=size.tiny)
+    table.cell(panel, 1, 0, preset, text_color=color.yellow, text_size=size.tiny)
+    table.cell(panel, 0, 1, "HIGH", text_color=color.red, text_size=size.tiny)
+    table.cell(panel, 1, 1, "S=" + str.tostring(S_detect_high) + " C=" + str.tostring(confirm_count_high) + " PG=" + str.tostring(price_gate_lb_high), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 2, "HIGH votes", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 1, 2, str.tostring(ph_confirms) + "/" + str.tostring(math.max(max_votes_high, high_required)), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 3, "HIGH accel", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 1, 3, str.tostring(momentum_velocity_high, "#.####"), text_color=use_momentum_velocity_high ? color.aqua : color.gray, text_size=size.tiny)
+    table.cell(panel, 0, 4, "LOW", text_color=color.green, text_size=size.tiny)
+    table.cell(panel, 1, 4, "S=" + str.tostring(S_detect_low) + " C=" + str.tostring(confirm_count_low) + " PG=" + str.tostring(price_gate_lb_low), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 5, "LOW votes", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 1, 5, str.tostring(pl_confirms) + "/" + str.tostring(math.max(max_votes_low, low_required)), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 6, "LOW drift", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 1, 6, str.tostring(pivot_drift_low, "#.####"), text_color=use_pivot_drift_low ? color.aqua : color.gray, text_size=size.tiny)
+    table.cell(panel, 0, 7, "Agreement", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 1, 7, "H " + str.tostring(agreement_high_high, "#.##") + " | L " + str.tostring(agreement_low_low, "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 0, 8, "Signals", text_color=color.white, text_size=size.tiny)
+    table.cell(panel, 1, 8, (pivot_high ? "HIGH" : pivot_low ? "LOW" : "---"), text_color=color.white, text_size=size.tiny)
+
+// Data window exports (high-side parity focus).
+plot(agreement_high_high, "agreement_high_side", display=display.data_window)
+plot(agreement_high_high, "dbg_agreement_high_high", display=display.data_window)
+plot(agreement_low_high, "dbg_agreement_low_high", display=display.data_window)
+plot(scales_high_high * 1.0, "dbg_scales_high_high", display=display.data_window)
+plot(scales_low_high * 1.0, "dbg_scales_low_high", display=display.data_window)
+plot(n_scales_high * 1.0, "dbg_n_scales_high", display=display.data_window)
+plot(ms_agree_high ? 1.0 : 0.0, "dbg_ms_agree_high", display=display.data_window)
+plot(dur_high_flag ? 1.0 : 0.0, "dbg_dur_high_flag", display=display.data_window)
+plot(scale_div_high, "dbg_scale_div_high", display=display.data_window)
+plot(scale_div_high_flag ? 1.0 : 0.0, "dbg_scale_div_high_flag", display=display.data_window)
+plot(momentum_velocity_high, "momentum_velocity_high", display=display.data_window)
+plot(pivot_drift_high, "pivot_drift_high", display=display.data_window)
+plot(ph_confirms * 1.0, "ph_confirms", display=display.data_window)
+plot(high_required * 1.0, "dbg_high_required", display=display.data_window)
+plot(gate_pass_high ? 1.0 : 0.0, "dbg_gate_pass_high", display=display.data_window)
+plot(bars_since_high_signal * 1.0, "dbg_bars_since_high_signal", display=display.data_window)
+plot(pivot_high ? 1.0 : 0.0, "dbg_pivot_high_raw", display=display.data_window)
+plot(t_up_h_eff ? 1.0 : 0.0, "dbg_high_vote_trend", display=display.data_window)
+plot(pd_dn_h_eff ? 1.0 : 0.0, "dbg_high_vote_pivot_drift", display=display.data_window)
+plot(vol_surge_high, "dbg_vol_surge_high", display=display.data_window)
+plot(1.0 / vol_surge_thresh_high, "dbg_vol_surge_high_threshold", display=display.data_window)
+plot(vs_h_eff ? 1.0 : 0.0, "dbg_high_vote_volume", display=display.data_window)
+plot(md_h_eff ? 1.0 : 0.0, "dbg_high_vote_momentum", display=display.data_window)
+plot(mv_h_eff ? 1.0 : 0.0, "dbg_high_vote_momentum_velocity", display=display.data_window)
+plot(va_h_eff ? 1.0 : 0.0, "dbg_high_vote_volatility", display=display.data_window)
+plot(g_h_eff ? 1.0 : 0.0, "dbg_high_vote_gjr", display=display.data_window)
+plot(h_h_eff ? 1.0 : 0.0, "dbg_high_vote_har", display=display.data_window)
+plot(price_high_ok ? 1.0 : 0.0, "price_gate_high", display=display.data_window)
+plot(er_val_high, "er_val_high", display=display.data_window)
+plot(baseline_ph, "baseline_pivot_high", display=display.data_window)
+
+// Alerts.
+alertcondition(pivot_high and not pivot_high[1], "Pivot High", "Speculatores V14: pivot HIGH")
+alertcondition(pivot_low and not pivot_low[1], "Pivot Low", "Speculatores V14: pivot LOW")

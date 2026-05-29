@@ -1,0 +1,3 @@
+# Local development install (editable + dev extras: cpu torch, pytest, ruff, mypy).
+# Usage: uv pip install -r requirements-dev.txt
+-e .[dev]

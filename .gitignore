@@ -1,0 +1,31 @@
+# Data lives in Google Drive (Colab) / locally in data/ — never committed.
+data/
+outputs/
+multirun/
+
+# Environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Model artifacts
+*.pt
+*.ckpt
+*.onnx
+
+# Secrets (per security rules — never commit)
+.env
+.env.*
+settings.json
+*.pem
+*.key
+credentials.json
+
+# Tooling caches
+.hydra/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/

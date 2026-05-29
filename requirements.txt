@@ -1,0 +1,14 @@
+# Colab runtime deps. NOTE: torch is intentionally omitted — Colab provides a
+# GPU-enabled torch build; do not override it here. Install with: pip install -q -e .
+numpy>=1.26
+pandas>=2.0
+pyarrow
+numba
+scikit-learn
+lightgbm
+hydra-core
+omegaconf
+optuna
+scipy
+matplotlib
+tqdm
