@@ -657,7 +657,7 @@ def _render_report(
     # The beat-the-baseline gate.
     lines.append("## Beat-the-baseline gate (TCN vs GBDT, same data + folds)")
     lines.append("")
-    lines.append("| side | GBDT F1 | TCN POOL F1 | Δ F1 | TCN P | TCN R | verdict |")
+    lines.append("| side | GBDT F1 | TCN POOL F1 | delta F1 | TCN P | TCN R | verdict |")
     lines.append("| :-- | --: | --: | --: | --: | --: | :-- |")
     for rep in reports:
         verdict = "TCN wins" if rep.pooled.f1 > rep.baseline_f1 else "GBDT wins"
