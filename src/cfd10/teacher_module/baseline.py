@@ -178,7 +178,7 @@ class GBDTConfig:
             "reg_lambda": self.reg_lambda,
             "scale_pos_weight": self.scale_pos_weight,
             "random_state": self.seed,
-            "n_jobs": 1,
+            "n_jobs": -1,
             "verbosity": -1,
         }
 
@@ -276,14 +276,25 @@ def _tune_threshold(
     top = float(np.nextafter(float(train_proba.max()), 0.0))
     candidates = np.unique(np.concatenate([candidates, np.array([top])]))
 
+    # Sparse-event detection: the F1 optimum flags only a small multiple of the
+    # true-event count. Candidates that flag far more bars have hopeless precision
+    # AND blow up the event match (O(n_pred * n_true) Hungarian) on large pooled
+    # train folds. We descend from the most confident threshold and stop once the
+    # flagged set exceeds a sane multiple of the true-event count: the flagged set
+    # grows monotonically as the threshold falls, so every lower candidate is also
+    # over budget. This bounds tuning cost without discarding the real optimum.
+    max_pred = max(512, 6 * int(train_true_idx.size))
+
     best_threshold = float(candidates[-1])
     best_f1 = -1.0
-    for thr in candidates:
+    for thr in candidates[::-1]:
         pred_idx = _positive_indices(train_proba, train_idx, float(thr))
+        if pred_idx.size > max_pred:
+            break
         _p, _r, f1 = event_prf(pred_idx, train_true_idx, cfg.tolerance)
-        # ">=" with an ascending sweep keeps the highest threshold among ties
+        # Descending sweep + strict ">" keeps the highest threshold among ties
         # (fewer false positives at equal F1).
-        if f1 >= best_f1:
+        if f1 > best_f1:
             best_f1 = f1
             best_threshold = float(thr)
     return best_threshold, float(max(best_f1, 0.0))
