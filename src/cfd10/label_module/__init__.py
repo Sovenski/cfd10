@@ -1,23 +1,18 @@
-"""cfd10 label layer: the forward-looking turn oracle (ground-truth supervision).
+"""cfd10 label layer: forward-looking turn oracle (ground truth).
 
-This package produces the per-bar *turn* labels the combiner is trained against.
-:func:`label_turns` assigns each bar a top and bottom score in ``[0, 1]`` (which
-doubles as a sample weight) plus a discrete tier, using a multi-scale nest of
-forward-looking extreme/reversal confirmations. The oracle may look ahead, but
-strictly no further than :attr:`OracleConfig.horizon` bars, so labels are
-reproducible under truncation / streaming.
+:func:`label_turns` (the *turn oracle*) assigns each bar a top and bottom score in
+``[0, 1]`` (which doubles as a sample weight) plus a discrete tier, using a multi-scale
+nest of forward-looking extreme/reversal confirmations weighted so a large-scale
+(structural) pivot counts far more than a small-scale one. It looks ahead no further
+than ``horizon`` bars, so labels are reproducible under truncation / streaming.
 
 Public API
 ----------
-Configuration
-    :class:`OracleConfig` (frozen) with its monotone :meth:`OracleConfig.weight`
-    curve, plus the :data:`WEIGHT_CURVE_REGISTRY` / :func:`register_weight_curve`
-    / :func:`get_weight_curve` weight-curve registry.
-Labelling
-    :func:`label_turns` and the fixed :data:`LABEL_COLUMNS` output schema.
-Side registry
-    :data:`ORACLE_SIDE_FACTORY` / :func:`register_side` / :func:`get_side_fn`
-    expose the per-side scoring reducer by name.
+:class:`OracleConfig` (frozen) with its monotone :meth:`OracleConfig.weight` curve,
+plus the :data:`WEIGHT_CURVE_REGISTRY` / :func:`register_weight_curve` /
+:func:`get_weight_curve` weight-curve registry; :func:`label_turns` and the fixed
+:data:`LABEL_COLUMNS` output schema; the per-side reducer registry
+:data:`ORACLE_SIDE_FACTORY` / :func:`register_side` / :func:`get_side_fn`.
 """
 
 from __future__ import annotations
