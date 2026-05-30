@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from cfd10.parity_module.verify import (
     ParityReport,
+    simulate_gboost,
     simulate_tree,
     verify_student_export,
 )
@@ -35,5 +36,6 @@ from cfd10.parity_module.verify import (
 __all__ = [
     "ParityReport",
     "simulate_tree",
+    "simulate_gboost",
     "verify_student_export",
 ]
